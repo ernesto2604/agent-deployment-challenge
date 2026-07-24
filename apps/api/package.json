@@ -1,0 +1,20 @@
+{
+  "name": "@challenge/api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/server.mjs",
+    "start": "node src/server.mjs",
+    "test": "node --test",
+    "db:migrate": "node src/db/migrate.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "pg": "^8.22.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
