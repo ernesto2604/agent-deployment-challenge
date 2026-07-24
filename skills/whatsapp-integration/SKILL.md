@@ -1,52 +1,102 @@
 ---
 name: whatsapp-integration
-description: Diseño técnico para la integración oficial con WhatsApp Business Cloud API. Permite recibir mensajes, asociarlos a la cuenta de usuario mediante su número de teléfono, procesarlos de forma asíncrona usando la memoria existente y responder utilizando el modelo configurado.
+description: Diseña la integración del Agent Console con WhatsApp Cloud API. Usa esta skill cuando sea necesario recibir mensajes de WhatsApp, asociarlos de forma segura con usuarios registrados, recuperar su memoria multiconversación y enviar respuestas mediante el modelo configurado.
 ---
 
 # WhatsApp Integration Skill
 
 ## Objetivo
 
-Esta skill proporciona el diseño técnico para la integración del **Agent Console** con **WhatsApp Business Cloud API** (Meta). El objetivo es que los usuarios registrados puedan chatear con su agente desde WhatsApp manteniendo su identidad, sesiones, y memoria histórica (FTS) de forma segura y escalable.
+Esta skill proporciona el diseño técnico para la integración del **Agent Console** con **WhatsApp Business Cloud API** (Meta). El objetivo es que los usuarios registrados puedan chatear con su agente desde WhatsApp manteniendo su identidad, contexto conversacional y memoria histórica (FTS) de forma segura y escalable.
 
 ---
 
 ## 1. Variables de Entorno (`.env`)
 
-Para la conexión con Meta, se deben añadir las siguientes variables al backend:
+Para la conexión con Meta, no se deben incluir secretos en el repositorio ni en las imágenes Docker; deben inyectarse mediante variables protegidas del entorno de despliegue o mediante un gestor de secretos.
 
 ```env
 # Meta WhatsApp Cloud API
 WHATSAPP_ENABLED=true
 WHATSAPP_VERIFY_TOKEN=tu_token_de_verificacion_webhook
 WHATSAPP_APP_SECRET=tu_app_secret_de_meta # Requerido para X-Hub-Signature-256
-WHATSAPP_API_TOKEN=tu_token_de_acceso_permanente
+WHATSAPP_API_TOKEN=tu_token_de_usuario_del_sistema # Token persistente con permisos whatsapp_business_messaging
 WHATSAPP_PHONE_NUMBER_ID=123456789012345
-WHATSAPP_API_VERSION=v19.0 # Versión configurable de Graph API
+WHATSAPP_API_VERSION=v25.0 # La versión debe fijarse explícitamente y revisarse antes del despliegue
 ```
 
 ---
 
 ## 2. Modelo de Datos y Asociación de Usuarios
 
-Actualmente, `memory.mjs` depende del `user_id` (UUID) para asegurar el aislamiento. Para vincular un número de WhatsApp entrante a un usuario registrado, se debe extender el esquema:
-
-### Alterar tabla `users` o crear tabla `identities`:
-La solución más sencilla es añadir el teléfono a `users` mediante una migración SQL:
+### Códigos de Vinculación (`identity_link_tokens`)
+El usuario autenticado en la aplicación web genera un código de vinculación de un solo uso (OTP) y lo envía desde el número de WhatsApp que desea asociar. Para almacenar los códigos pendientes de forma segura:
 
 ```sql
-ALTER TABLE users ADD COLUMN phone_number VARCHAR(20) UNIQUE;
-CREATE INDEX idx_users_phone ON users(phone_number);
+CREATE TABLE identity_link_tokens (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL CHECK (provider IN ('whatsapp')),
+  token_hash TEXT NOT NULL UNIQUE,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX identity_link_tokens_active_index
+  ON identity_link_tokens (expires_at)
+  WHERE used_at IS NULL;
 ```
 
-### Tabla de Idempotencia (`whatsapp_messages`):
-Para evitar procesar eventos duplicados de Meta, se debe almacenar el `message_id`:
+El OTP nunca se almacena en texto plano, sino mediante un hash. Cuando llega un mensaje de WhatsApp con un código válido, no utilizado y no caducado, se crea la identidad con `verified_at = NOW()` y se marca el código mediante `used_at`. Los códigos deben tener una duración corta y un número limitado de intentos.
+
+### Verificación de Identidad (`user_identities`)
+Tabla que almacena exclusivamente las identidades que ya han superado el proceso de vinculación:
 
 ```sql
-CREATE TABLE processed_webhook_events (
-  provider_message_id VARCHAR(255) PRIMARY KEY,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE user_identities (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL CHECK (provider IN ('whatsapp')),
+  provider_user_id VARCHAR(32) NOT NULL,
+  verified_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (provider, provider_user_id)
 );
+```
+
+### Conversación del Canal (`channel_conversations`)
+Para saber qué conversación utilizar en WhatsApp y controlar el periodo de inactividad de forma independiente a la web:
+
+```sql
+CREATE TABLE channel_conversations (
+  identity_id UUID PRIMARY KEY REFERENCES user_identities(id) ON DELETE CASCADE,
+  conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  last_activity_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+### Tabla de Idempotencia y Trabajos (`whatsapp_webhook_events`)
+Para procesar eventos asíncronamente y manejar reintentos sin generar respuestas dobles:
+
+```sql
+CREATE TABLE whatsapp_webhook_events (
+  provider_message_id VARCHAR(255) PRIMARY KEY,
+  message_payload JSONB NOT NULL,
+  response_text TEXT,
+  outbound_message_id VARCHAR(255),
+  status VARCHAR(20) NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  processed_at TIMESTAMPTZ
+);
+
+CREATE INDEX whatsapp_webhook_events_pending_index
+  ON whatsapp_webhook_events (status, next_attempt_at);
 ```
 
 ---
@@ -54,65 +104,86 @@ CREATE TABLE processed_webhook_events (
 ## 3. Endpoints del Webhook (`/api/webhook/whatsapp`)
 
 ### GET: Validación de Meta (Handshake)
-Meta envía un reto que debe ser respondido si el token coincide.
-- **Validación**: Compara `hub.verify_token` con `WHATSAPP_VERIFY_TOKEN`.
-- **Respuesta**: Devuelve el entero `hub.challenge`.
+1. Comprobar que `hub.mode === "subscribe"`.
+2. Comparar `hub.verify_token` con `WHATSAPP_VERIFY_TOKEN`.
+3. Si ambos valores son válidos, devolver `hub.challenge` como texto plano con `HTTP 200`.
+4. Si la validación falla, devolver `HTTP 403`.
 
 ### POST: Recepción de Mensajes
-Debe incorporar reconocimiento rápido y procesamiento asíncrono para evitar timeouts de Meta.
 
-#### A. Reconocimiento Rápido (Early ACK) y Seguridad
-1. **Firma**: Calcular HMAC-SHA256 del payload crudo usando `WHATSAPP_APP_SECRET` y compararlo con la cabecera `X-Hub-Signature-256`. Si falla, devolver `401 Unauthorized`.
-2. **ACK Temprano**: Si la firma es correcta, devolver inmediatamente `HTTP 200 OK`.
-3. **Paso a Background**: Iniciar el procesamiento del mensaje de forma asíncrona (Promise o cola tipo BullMQ/Redis).
+#### A. RAW Body y Firma HMAC (Seguridad)
+El endpoint de WhatsApp debe registrarse **antes** del middleware global `express.json()`, usando `express.raw({ type: "application/json" })`, o utilizar la opción `verify` de `express.json()` para conservar una copia exacta del RAW body. 
 
-#### B. Procesamiento Asíncrono
-1. **Idempotencia**: Extraer el `id` del mensaje entrante. Intentar insertar en `processed_webhook_events`. Si hay colisión de clave primaria, ignorar silenciosamente (evento duplicado).
-2. **Identidad**: Extraer el teléfono (`from`). Hacer `SELECT id FROM users WHERE phone_number = $1`. Si no existe, detener o enviar mensaje de invitación a registro.
-3. **Contexto**: Obtener la conversación actual del usuario o crear una nueva si han pasado X horas.
-4. **Memoria y LLM**: 
-   - Llamar a `findCrossConversationMemory(pool, { userId })`.
-   - Preparar el prompt asegurando la inyección segura de la memoria.
-   - Llamar a `requestCompletion()`.
-5. **Persistencia**: Guardar el mensaje del usuario y la respuesta del asistente en PostgreSQL usando `saveMessage`.
-6. **Envío Final**: Hacer una petición HTTP `POST` a `https://graph.facebook.com/${WHATSAPP_API_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages` con el texto generado y el `WHATSAPP_API_TOKEN` como Bearer token.
+Antes de llamar a `crypto.timingSafeEqual`, se debe comprobar el prefijo `sha256=` y verificar que ambos buffers tienen la misma longitud. La firma nunca debe calcularse serializando de nuevo `request.body`.
+
+#### B. Persistencia y ACK Temprano (Endpoint)
+Lo correcto en producción sería:
+1. Verificar la firma HMAC de Meta.
+2. Validar mínimamente el evento (`object === "whatsapp_business_account"`).
+3. Parsear el payload y recorrer sus elementos `entry`, `changes` y `messages`.
+4. Crear de forma idempotente un trabajo duradero **por cada mensaje entrante** con `type === "text"`, utilizando el identificador del mensaje como clave primaria e insertando el mensaje individual en `message_payload`. Si la base de datos falla, devolver un `HTTP 500`.
+5. Una vez persistidos todos los trabajos, responder `HTTP 200 OK` a Meta.
+
+#### C. Lógica del Procesamiento Asíncrono (Worker)
+Cada worker procesa directamente un mensaje individual almacenado en `message_payload`, adquiriendo el trabajo de forma atómica para evitar ejecuciones concurrentes del mismo mensaje:
+
+```sql
+SELECT provider_message_id FROM whatsapp_webhook_events
+WHERE status IN ('pending', 'failed') AND next_attempt_at <= NOW()
+ORDER BY received_at FOR UPDATE SKIP LOCKED LIMIT 1;
+```
+*(Tras adquirirlo, se cambia el `status` a `processing` en la misma transacción).*
+
+El flujo principal será:
+1. **Resolver la identidad**: Normalizar `from` a formato E.164 y buscar:
+   ```sql
+   SELECT user_id FROM user_identities
+   WHERE provider = 'whatsapp' AND provider_user_id = $1 AND verified_at IS NOT NULL;
+   ```
+   *(Si no existe una identidad verificada, no se proporcionará acceso a la memoria privada y se responderá únicamente con instrucciones para vincular la cuenta o introducir el OTP).*
+2. **Encontrar o crear la conversación del canal**: Buscar la conversación asociada a la identidad en `channel_conversations`. Si no existe o se ha superado el periodo de inactividad, crear una nueva.
+3. **Guardar** el mensaje entrante en la base de datos.
+4. **Recuperar** el historial de la conversación actual:
+   ```javascript
+   const conversationMessages = await getConversationMessages(pool, { conversationId, userId });
+   ```
+5. **Recuperar** memoria de otras conversaciones:
+   ```javascript
+   const memoryContext = await findCrossConversationMemory(pool, {
+     userId,
+     currentConversationId: conversationId,
+     queryText: incomingText,
+   });
+   ```
+6. **Construir** el prompt y generar la respuesta con el LLM.
+7. **Guardar** la respuesta del asistente en PostgreSQL.
+8. **Enviar** por WhatsApp mediante Graph API.
+
+#### D. Petición de Salida (Graph API)
+La respuesta se enviará mediante:
+```http
+POST https://graph.facebook.com/${WHATSAPP_API_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages
+Authorization: Bearer ${WHATSAPP_API_TOKEN}
+Content-Type: application/json
+
+{
+  "messaging_product": "whatsapp",
+  "recipient_type": "individual",
+  "to": "34600000000",
+  "type": "text",
+  "text": {
+    "preview_url": false,
+    "body": "Respuesta generada por el agente"
+  }
+}
+```
 
 ---
 
-## 4. Ejemplos de Verificación Local
+## 4. Consideraciones y Políticas
 
-### Simular Handshake:
-```bash
-curl -X GET "http://localhost:4319/api/webhook/whatsapp?hub.mode=subscribe&hub.verify_token=tu_token_de_verificacion_webhook&hub.challenge=11582014"
-```
-
-### Simular Mensaje Entrante (Requiere firma correcta en X-Hub-Signature-256):
-```bash
-# Ejemplo simplificado. En la realidad, debes firmar el RAW BODY con tu APP_SECRET
-curl -X POST "http://localhost:4319/api/webhook/whatsapp" \
-  -H "Content-Type: application/json" \
-  -H "X-Hub-Signature-256: sha256=abcdef1234567890..." \
-  -d '{
-    "object": "whatsapp_business_account",
-    "entry": [{
-      "id": "12345",
-      "changes": [{
-        "value": {
-          "messages": [{
-            "id": "wamid.HBgL...",
-            "from": "34600000000",
-            "text": { "body": "Hola, ¿puedes resumir mis tareas?" }
-          }]
-        }
-      }]
-    }]
-  }'
-```
-
----
-
-## 5. Consideraciones de Producción
-
-- **Prompt Injection**: Al inyectar historial histórico recuperado por FTS en el system prompt, se debe usar un formato delimitado claro (p.ej. `<contexto>...</contexto>`) e instruir al modelo explícitamente para que no obedezca comandos dentro de esas etiquetas.
-- **Rate Limiting Meta**: Meta impone límites sobre cuántos mensajes se pueden enviar por segundo. Para gran escala, usar una cola de trabajos (ej. Redis/Bull) es fundamental para respetar los límites sin perder mensajes.
-- **Ventana de 24 horas**: Se debe almacenar la fecha del último mensaje del usuario. Solo se puede responder libremente en las 24 horas siguientes.
+- **Idempotencia del Worker**: Cada fase del procesamiento debe ser reanudable. Si la respuesta del asistente ya fue generada y persistida (`response_text`), un reintento por fallo de red no debe volver a llamar al LLM; únicamente debe reintentar el envío pendiente a WhatsApp. Al tener éxito, se almacena el `outbound_message_id`.
+- **Ventana de 24 horas**: Comienza o se renueva cuando el usuario envía un mensaje. Dentro de ella se pueden enviar respuestas de texto libres. Fuera de ella, solo se puede contactar al usuario mediante una plantilla aprobada por Meta.
+- **Cumplimiento normativo**: Antes de activar la integración, revisar las condiciones vigentes de WhatsApp Business Platform, los requisitos de consentimiento y la normativa aplicable, especialmente el RGPD, la LOPDGDD y el Reglamento (UE) 2024/1689 (AI Act).
+- **Privacidad**: Ofuscar teléfonos y contenido en logs, normalizar los números a E.164, definir la retención de identidades y eliminar o minimizar el `message_payload` una vez completado el procesamiento.
+- **Prompt Injection**: Inyectar historial FTS en el prompt requiere etiquetas delimitadas (`<contexto>...</contexto>`) e instruir explícitamente al LLM para no obedecer inyecciones almacenadas en el historial.
